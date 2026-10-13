@@ -2127,6 +2127,32 @@ export interface WidgetOptions {
   theme?: DeepPartial<Theme>;
 }
 
+// el.patch: per table NAME, rows to insert, rows to update (merged into the row
+// with the same key), and keys to remove (a bare value for a one-field key,
+// otherwise a row-shaped object or an array of the key fields' values).
+export type PatchSpec = Record<string, { insert?: Datum[]; update?: Datum[]; remove?: unknown[] }>;
+export interface PatchOptions {
+  history?: 'keep' | 'record';
+}
+export interface PatchResult {
+  inserted: number;
+  updated: number;
+  // Rows gone, including links a removed node took with it.
+  removed: number;
+  // Updates whose key named no row (a person deleted it first, say).
+  missing: { table: string; key: unknown[] }[];
+  // Inserts whose key already named a row.
+  conflicts: { table: string; key: unknown[] }[];
+}
+// What one finished gesture did — the payload of `on('gesture')`. Not to be
+// confused with GestureEvent below, which is one renderer-shaped INPUT event.
+export interface GestureRecord {
+  // Deduplicated: a drag fires its edit on every move.
+  edits: { type: string; name?: string; table: string }[];
+  before: Datum[] | Record<string, Datum[]>;
+  after: Datum[] | Record<string, Datum[]>;
+}
+
 // The DOM element Elicit returns: the chart container plus a small observation
 // API over the belief-data store. `getData`/`setData` read/replace the committed
 // dataset; `on` subscribes to commits and stage changes. These add no interaction
@@ -2143,6 +2169,16 @@ export interface ElicitElement extends HTMLDivElement {
   // Replace the dataset and re-render. Bypasses constraints (trusted seed/reset).
   // Also clears the undo history: a reseed is a new starting point, not an edit.
   setData(data: Datum[] | Record<string, Datum[]>): void;
+  // Merge rows into the live dataset by KEY, for a second writer (an agent, a
+  // server) working on the data while a person edits it. Unlike setData it keeps
+  // the selection, any stroke in flight and, by default, the undo history: with
+  // `history: 'keep'` the write is rebased into every snapshot, so undo never
+  // reverts it; `'record'` makes it an undo step of its own. A row's key is its
+  // table's `key: true` field, or, for a links table without one, its `ref` ends.
+  // Trusted like setData (constraints gate gestures); refs still cascade. A patch
+  // that removes rows waits for a stroke in flight to end and returns
+  // `{ deferred: true }`; otherwise it returns what it did.
+  patch(changes: PatchSpec, options?: PatchOptions): PatchResult | { deferred: true };
   // Step back / forward one GESTURE. A drag is one entry however many commits it
   // made along the way; a click or a typed commit is its own. Both restore the
   // dataset AND the schema (an axis edit reshapes a domain) and fire 'change'.
@@ -2160,6 +2196,12 @@ export interface ElicitElement extends HTMLDivElement {
   // 'select' second argument: bare row indices for a single-table chart (a bare
   // index names a row unambiguously there), `{ table, index }` for a multi-table
   // one — where a number alone would name a row in no particular table.
+  //
+  // 'gesture': one event per gesture that changed data, when the gesture ENDS — a
+  // drag is one event however many 'change's it fired on the way. Carries the
+  // dataset before and after (shaped like getData) and the edits that fired, so a
+  // caller can log what a person did without diffing every pointermove.
+  on(type: 'gesture', cb: (record: GestureRecord) => void): () => void;
   on(type: 'change' | 'stage' | 'select', cb: (...args: any[]) => void): () => void;
   // ── Selection: transient pipeline state, NOT the belief data. Its own tiny API
   // beside getData/setData because a `selected` data column is exactly what this

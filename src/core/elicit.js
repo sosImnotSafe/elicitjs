@@ -420,9 +420,10 @@ export function Elicit(spec) {
     // Caller-facing observers. `change` fires on every committed edit; `stage` fires
     // when setStage advances; `select` fires when the selection changes (no data
     // moved, so it is NOT a `change`). Attached to the returned container as
-    // `.on('change' | 'stage' | 'select', cb)`.
-    /** @type {{ change: Set<Function>, stage: Set<Function>, select: Set<Function> }} */
-    const listeners = { change: new Set(), stage: new Set(), select: new Set() };
+    // `.on('change' | 'stage' | 'select', cb)`. `gesture` fires once when a gesture
+    // that changed data ENDS — see notifyGesture.
+    /** @type {{ change: Set<Function>, stage: Set<Function>, select: Set<Function>, gesture: Set<Function> }} */
+    const listeners = { change: new Set(), stage: new Set(), select: new Set(), gesture: new Set() };
 
     // ---- Undo history --------------------------------------------------------
     // An elicitation is someone's belief being drafted, so "take that back" is a
@@ -445,8 +446,15 @@ export function Elicit(spec) {
     let past = [];
     /** @type {any[]} */
     let future = [];
-    /** @type {{ recorded: boolean } | null} */
+    // A transaction is one GESTURE. Besides whether it has snapshotted yet, it keeps
+    // the state it started from and the edits that fired in it, so its end can be
+    // reported as one event ('gesture') rather than as every commit along the way.
+    /** @type {{ recorded: boolean, before: any, edits: any[] } | null} */
     let txn = null;
+    // External writes (el.patch) that would renumber rows wait here while a stroke
+    // is in flight — see el.patch.
+    /** @type {{ plan: any[], history: 'keep' | 'record' }[]} */
+    let pending = [];
 
     const snapshot = () => ({
         tables: structuredClone(tables),
@@ -473,8 +481,15 @@ export function Elicit(spec) {
     // not clone the dataset. The snapshot is taken lazily by recordHistory, on the
     // first commit — which is safe because every commit path calls recordHistory
     // BEFORE it mutates `dataset`/`schema`, so "now" is still the pre-gesture state.
-    const beginTxn = () => { if (!txn) txn = { recorded: false }; };
-    const endTxn = () => { txn = null; };
+    const beginTxn = () => { if (!txn) txn = { recorded: false, before: null, edits: [] }; };
+    // `notify` is true only where a gesture really ENDS (the dispatch). setData, undo
+    // and redo close a transaction too, but no gesture happened there to report.
+    const endTxn = (notify = false) => {
+        const done = txn;
+        txn = null;
+        if (notify && done && done.recorded) notifyGesture(done);
+        if (pending.length) flushPending();
+    };
 
     // Called by every commit path, BEFORE it mutates state. The first commit in a
     // transaction snapshots the (still pre-gesture) state and drops the redo stack —
@@ -482,10 +497,32 @@ export function Elicit(spec) {
     const recordHistory = () => {
         if (!txn) beginTxn();
         if (!txn || txn.recorded) return;
-        past.push(snapshot());
+        const snap = snapshot();
+        past.push(snap);
         if (past.length > MAX_HISTORY) past.shift();
         future = [];
+        // The same object the undo stack holds, so an external write rebased into
+        // history (el.patch, 'keep') is rebased into the gesture's "before" too, and
+        // a listener diffing before/after sees the gesture and nothing else.
+        txn.before = snap.tables;
         txn.recorded = true;
+    };
+
+    // One event per gesture that changed data: what it started from, what it left,
+    // and which edits did it (deduplicated — a drag fires its edit on every move).
+    /** @param {{ before: any, edits: any[] }} done */
+    const notifyGesture = (done) => {
+        if (!listeners.gesture.size) return;
+        const seen = new Set();
+        const edits = done.edits.filter((e) => {
+            const k = `${e.type}\u0000${e.name ?? ''}\u0000${e.table}`;
+            if (seen.has(k)) return false;
+            seen.add(k);
+            return true;
+        });
+        const shape = (/** @type {any} */ t) => (isBareForm(schemaSpec) ? t[schemaSpec.primary] : t);
+        const event = { edits, before: structuredClone(shape(done.before)), after: structuredClone(shapeData()) };
+        for (const cb of listeners.gesture) cb(event);
     };
 
     // Notify a committed change. One place, so undo/redo tell the caller exactly
@@ -1269,6 +1306,11 @@ export function Elicit(spec) {
     const runEdit = (feature, edit, event, index) => {
         const proposed = computeEdit(feature, edit, event, index);
         if (!proposed) return false;
+        // Which edits a gesture fired, for its 'gesture' event. A selection writes no
+        // data, so it is not part of what the gesture changed.
+        if (txn && proposed.kind !== 'selection') {
+            txn.edits.push({ type: edit.type, name: edit.name, table: targetTableOf(feature, edit) });
+        }
         // A domain edit reshapes the schema (and maybe the dataset / chart size).
         if (proposed.kind === 'domain') {
             return commitDomainEdit(proposed.result, targetTableOf(feature, edit));
@@ -1623,7 +1665,7 @@ export function Elicit(spec) {
         // close it below, so it can't absorb the next one.
         // dragstart always starts a fresh one, so a stroke whose dragend never
         // arrived can't leak its stale "before" into the next gesture.
-        if (event.type === 'dragstart') { endTxn(); beginTxn(); }
+        if (event.type === 'dragstart') { endTxn(true); beginTxn(); }
         else if (!txn) beginTxn();
 
         // Grab state rides the SAME bracket as the transaction — one stroke, one
@@ -1658,7 +1700,7 @@ export function Elicit(spec) {
         // synthetic drag is a complete gesture on its own, so it closes too —
         // otherwise it would stay open and swallow whatever gesture came next.
         if (event.type === 'dragend' || event.nudge
-            || (event.type !== 'dragstart' && event.type !== 'drag')) endTxn();
+            || (event.type !== 'dragstart' && event.type !== 'drag')) endTxn(true);
 
         if (shouldRender) {
             update();
@@ -1698,8 +1740,164 @@ export function Elicit(spec) {
         // replaced, under a lock that no longer covers them).
         past = [];
         future = [];
+        // Writes queued against the old dataset name rows that may not exist in the
+        // new one; a reseed is a new starting point for them too.
+        pending = [];
         endTxn();
         update();
+    };
+
+    // ── External writes: el.patch ──────────────────────────────────────────────
+    // setData is a RESEED, and says so: history, selection and any stroke in flight
+    // all go. That is right for "load a different dataset" and wrong for a second
+    // writer working on the same one — an agent marking a step done while a person
+    // drags another. el.patch is that second writer's door: rows addressed by KEY,
+    // not index, merged into the live dataset without disturbing the person.
+    //
+    // A row's key is its table's `key: true` field. A links table usually declares
+    // none, and there a link IS its pair of `ref` ends — the same identity a
+    // `unique({ field: ['source', 'target'] })` constraint already treats as one.
+
+    /** @param {string} name @returns {string[]} */
+    const keyFieldsOf = (name) => {
+        const table = schemaSpec.tables[name];
+        if (!table) throw new Error(`patch(): there is no table named "${name}".`);
+        const fields = Object.entries(table.fields);
+        const keys = fields.filter(([, f]) => f && f.key).map(([k]) => k);
+        if (keys.length) return keys;
+        const refs = fields.filter(([, f]) => f && f.type === 'ref').map(([k]) => k);
+        if (refs.length) return refs;
+        throw new Error(`patch(): table "${name}" has no key field (\`key: true\`) and no \`ref\` fields, so its rows cannot be addressed.`);
+    };
+    /** @param {string[]} fields @param {any} row */
+    const keyOfRow = (fields, row) => JSON.stringify(fields.map((f) => (row ? row[f] : undefined)));
+    /** A `remove` entry: the bare key value for a one-field key, else a row-shaped object or an array. */
+    /** @param {string[]} fields @param {any} k */
+    const keyOfRemoval = (fields, k) => {
+        if (Array.isArray(k)) return JSON.stringify(k);
+        if (k != null && typeof k === 'object') return keyOfRow(fields, k);
+        return JSON.stringify([k]);
+    };
+
+    /** @param {any} changes */
+    const compilePatch = (changes) => Object.entries(changes || {}).map(([name, ops]) => {
+        const fields = keyFieldsOf(name);
+        return {
+            name,
+            fields,
+            insert: ops.insert || [],
+            update: ops.update || [],
+            remove: new Set((ops.remove || []).map((/** @type {any} */ k) => keyOfRemoval(fields, k))),
+        };
+    });
+
+    // Apply a compiled patch to one set of tables — the live ones, or a history
+    // snapshot. `report` is passed for the live tables only: a snapshot that lacks a
+    // row the live data has is ordinary history, not a conflict.
+    /** @param {Record<string, any[]>} target @param {any[]} plan @param {any} [report] */
+    const applyPatchTo = (target, plan, report) => {
+        for (const op of plan) {
+            let rows = target[op.name] || [];
+            if (op.remove.size) rows = rows.filter((r) => !op.remove.has(keyOfRow(op.fields, r)));
+            const at = new Map(rows.map((r, i) => [keyOfRow(op.fields, r), i]));
+            for (const row of op.update) {
+                const k = keyOfRow(op.fields, row);
+                const i = at.get(k);
+                if (i === undefined) { if (report) report.missing.push({ table: op.name, key: JSON.parse(k) }); continue; }
+                rows[i] = { ...rows[i], ...structuredClone(row) };
+                if (report) report.updated++;
+            }
+            for (const row of op.insert) {
+                const k = keyOfRow(op.fields, row);
+                if (at.has(k)) { if (report) report.conflicts.push({ table: op.name, key: JSON.parse(k) }); continue; }
+                at.set(k, rows.length);
+                rows.push(structuredClone(row));
+                if (report) report.inserted++;
+            }
+            target[op.name] = rows;
+        }
+        // A removed node takes its links with it here exactly as in a gesture.
+        enforceRefs(schemaSpec, target);
+    };
+
+    /** @param {any[]} plan @param {'keep' | 'record'} history */
+    const applyPatchLive = (plan, history) => {
+        // Selection names rows by index, and a removal renumbers rows: remember the
+        // selected rows by key, find them again afterwards.
+        const remembered = [...ui.selection].map(selParse).map(({ table, index }) => {
+            const fields = schemaSpec.tables[table] ? safeKeyFields(table) : null;
+            return { table, key: fields ? keyOfRow(fields, (tables[table] || [])[index]) : null, fields };
+        });
+        // A 'seed' lock reads "the first N rows". Removals keep order and inserts
+        // append, so the seeded rows stay at the head; only N has to shrink.
+        /** @type {Record<string, Set<string>>} */
+        const seededKeys = {};
+        for (const op of plan) {
+            seededKeys[op.name] = new Set((tables[op.name] || []).slice(0, seedCounts[op.name] || 0).map((r) => keyOfRow(op.fields, r)));
+        }
+        const sizes = Object.fromEntries(Object.entries(tables).map(([n, r]) => [n, r.length]));
+
+        if (history === 'record') {
+            past.push(snapshot());
+            if (past.length > MAX_HISTORY) past.shift();
+            future = [];
+        }
+        const report = { inserted: 0, updated: 0, removed: 0, missing: /** @type {any[]} */ ([]), conflicts: /** @type {any[]} */ ([]) };
+        applyPatchTo(tables, plan, report);
+        validateTables(schemaSpec, tables, 'patch()');
+        // 'keep': the write is a fact about the data, not a step of the person's.
+        // Rebase it into every snapshot, so undoing their last drag cannot revert it.
+        if (history === 'keep') for (const snap of [...past, ...future]) applyPatchTo(snap.tables, plan);
+
+        // Removed = rows gone, net of the rows inserted (cascaded links included).
+        let net = 0;
+        for (const name of new Set([...Object.keys(sizes), ...Object.keys(tables)])) {
+            net += (sizes[name] || 0) - (tables[name] || []).length;
+        }
+        report.removed = net + report.inserted;
+        for (const op of plan) {
+            if (seedCounts[op.name]) seedCounts[op.name] = (tables[op.name] || []).filter((r) => seededKeys[op.name].has(keyOfRow(op.fields, r))).length;
+        }
+
+        const before = [...ui.selection].join('|');
+        ui.selection.clear();
+        for (const { table, key, fields } of remembered) {
+            if (key == null || !fields) continue;
+            const i = (tables[table] || []).findIndex((r) => keyOfRow(fields, r) === key);
+            if (i >= 0) ui.selection.add(selKey(table, i));
+        }
+        ui.preview = null;
+        ui.hover = null;
+        notifyChange();
+        if ([...ui.selection].join('|') !== before) notifySelect();
+        update();
+        return report;
+    };
+    /** @param {string} table */
+    const safeKeyFields = (table) => { try { return keyFieldsOf(table); } catch { return null; } };
+
+    const flushPending = () => {
+        const queue = pending;
+        pending = [];
+        for (const p of queue) applyPatchLive(p.plan, p.history);
+    };
+
+    el.patch = (/** @type {any} */ changes, /** @type {{ history?: 'keep' | 'record' }} */ options = {}) => {
+        const history = options.history ?? 'keep';
+        if (history !== 'keep' && history !== 'record') {
+            throw new Error(`patch(): history is "keep" or "record", not "${history}".`);
+        }
+        const plan = compilePatch(changes);
+        // Mid-stroke, the renderer holds the grabbed row by the INDEX it had at
+        // dragstart. Field writes and appends renumber nothing, so they land now; a
+        // removal would make the stroke write the wrong row, so it waits for the
+        // stroke to end — and so does anything queued behind it, so writes land in
+        // the order they were made.
+        if (txn && (pending.length || plan.some((op) => op.remove.size))) {
+            pending.push({ plan, history });
+            return { deferred: true };
+        }
+        return applyPatchLive(plan, history);
     };
 
     // ── Selection: read/drive the transient selection from outside ────────────
@@ -2002,7 +2200,7 @@ export function Elicit(spec) {
         return true;
     };
     // Subscribe to committed changes; returns an unsubscribe function.
-    el.on = (/** @type {'change' | 'stage' | 'select'} */ type, /** @type {Function} */ cb) => {
+    el.on = (/** @type {'change' | 'stage' | 'select' | 'gesture'} */ type, /** @type {Function} */ cb) => {
         listeners[type].add(cb);
         return () => listeners[type].delete(cb);
     };
