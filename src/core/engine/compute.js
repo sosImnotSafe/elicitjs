@@ -36,6 +36,7 @@ import { warn } from '../dev.js';
  *   commitSelectionEdit: (sel: any, table?: string) => boolean,
  *   recordHistory: () => void,
  *   notifyChange: () => void,
+ *   noteEdit?: (edit: { type: string, name?: string, table: string }) => void,
  *   applyResize: (size: { width?: number, height?: number }) => void,
  * }} deps
  */
@@ -45,7 +46,7 @@ export function createCompute(chart, deps) {
         tableOf, targetTableOf, isLockedIn, checkRows,
         nodeBoxRule, nodePortsRule, containsRule, channelsDrawing,
         settleNodes, settledNodes, heldStill, activeEdits,
-        selectionPrimary, commitSelectionEdit, recordHistory, notifyChange,
+        selectionPrimary, commitSelectionEdit, recordHistory, notifyChange, noteEdit,
     } = deps;
     const applyResize = deps.applyResize;
 
@@ -271,6 +272,9 @@ export function createCompute(chart, deps) {
     const runEdit = (feature, edit, event, index) => {
         const proposed = computeEdit(feature, edit, event, index);
         if (!proposed) return false;
+        // Which edits a gesture fired, for its 'gesture' event. A selection writes no
+        // data, so it is not part of what the gesture changed.
+        if (proposed.kind !== 'selection' && noteEdit) noteEdit({ type: edit.type, name: edit.name ?? undefined, table: targetTableOf(feature, edit) });
         // A domain edit reshapes the schema (and maybe the dataset / chart size).
         if (proposed.kind === 'domain') {
             return commitDomainEdit(proposed.result, targetTableOf(feature, edit));

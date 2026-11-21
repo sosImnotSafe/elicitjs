@@ -2854,6 +2854,32 @@ export interface WidgetOptions {
   theme?: ThemeSpec;
 }
 
+// patch: per table NAME, rows to insert, rows to update (merged into the row with
+// the same key), and keys to remove (a bare value for a one-field key, otherwise a
+// row-shaped object or an array of the key fields' values).
+export type PatchSpec = Record<string, { insert?: Datum[]; update?: Datum[]; remove?: unknown[] }>;
+export interface PatchOptions {
+  history?: 'keep' | 'record';
+}
+export interface PatchResult {
+  inserted: number;
+  updated: number;
+  // Rows gone, including links a removed node took with it.
+  removed: number;
+  // Updates whose key named no row (a person deleted it first, say).
+  missing: { table: string; key: unknown[] }[];
+  // Inserts whose key already named a row.
+  conflicts: { table: string; key: unknown[] }[];
+}
+// What one finished gesture did: the payload of `on('gesture')`. Not to be
+// confused with GestureEvent, which is one renderer-shaped INPUT event.
+export interface GestureRecord {
+  // Deduplicated: a drag fires its edit on every move.
+  edits: { type: string; name?: string; table: string }[];
+  before: Datum[] | Record<string, Datum[]>;
+  after: Datum[] | Record<string, Datum[]>;
+}
+
 // The dataset `Elicit.dataset(spec)` returns: the rows, their schema, undo history
 // and selection, shared by every chart made from it with `chart(spec)`. Its
 // methods read and replace the data from outside; they add no interaction path —
@@ -2891,6 +2917,16 @@ export interface Dataset {
    * range, or a value the field's type cannot hold.
    */
   set(field: string, value: any, options?: { index?: number; table?: string }): boolean;
+  // Merge rows into the live dataset by KEY, for a second writer (an agent, a
+  // server) working on the data while a person edits it. Unlike setData it keeps
+  // the selection, any stroke in flight and, by default, the undo history: with
+  // `history: 'keep'` the write is rebased into every snapshot, so undo never
+  // reverts it; `'record'` makes it an undo step of its own. A row's key is its
+  // table's `key: true` field, or, for a links table without one, its `ref` ends.
+  // Trusted like setData (constraints gate gestures); refs still cascade. A patch
+  // that removes rows waits for a stroke in flight to end and returns
+  // `{ deferred: true }`; otherwise it returns what it did. Fires 'change'.
+  patch(changes: PatchSpec, options?: PatchOptions): PatchResult | { deferred: true };
   // Step back / forward one GESTURE. A drag is one entry however many commits it
   // made along the way; a click or a typed commit is its own. Both restore the
   // dataset AND the schema (an axis edit reshapes a domain) and fire 'change'.
@@ -2909,6 +2945,12 @@ export interface Dataset {
   // index names a row unambiguously there), `{ table, index }` for a multi-table
   // one — where a number alone would name a row in no particular table.
   on(type: 'change' | 'select' | 'hover', cb: (...args: any[]) => void): () => void;
+  // 'gesture': one event per gesture that changed data, when the gesture ENDS: a
+  // drag is one event however many 'change's it fired on the way. Carries the
+  // dataset before and after (shaped like getData) and the edits that fired, so a
+  // caller can turn what a person did into one operation without diffing every
+  // pointermove. Not fired by setData, set, patch, undo or redo.
+  on(type: 'gesture', cb: (record: GestureRecord) => void): () => void;
   // ── Hover: the one row under the pointer in a chart whose hover is linked
   // (effects.hovered.link), shown by every linked chart. Interface state like the
   // selection: no 'change', no undo step.
@@ -2962,6 +3004,7 @@ export interface Chart extends Omit<Dataset, 'chart' | 'on'> {
   // 'change', 'select' and 'hover' are the dataset's (see Dataset.on); 'stage' is
   // this chart's: (stageIndex, stageLabel?) on a stage change.
   on(type: 'change' | 'stage' | 'select' | 'hover', cb: (...args: any[]) => void): () => void;
+  on(type: 'gesture', cb: (record: GestureRecord) => void): () => void;
   // Multi-stage controls (see ChartSpec.stage). getStage reads the current index.
   getStage(): number;
   // Optional label for the current stage (from ChartSpec.stageLabels), or null.

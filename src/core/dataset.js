@@ -55,7 +55,9 @@ import { createHover } from './engine/hover.js';
  * @property {() => boolean} linked  do two or more charts draw this dataset?
  * @property {() => void} recordHistory  before a commit (engine/history.js)
  * @property {(type: string) => void} gestureTxn
- * @property {() => void} endTxn
+ * @property {() => void} endTxn  where a gesture ends: closes it and fires `gesture`
+ * @property {(edit: { type: string, name?: string, table: string }) => void} noteEdit  an edit
+ *   this chart's open gesture fired (for `gesture`)
  * @property {(stroking: boolean) => { space: boolean } | null} settleTurn  may this chart
  *   settle the hierarchy at render time, and push rows apart? (see `layout`)
  * @property {() => boolean} ownsLayout  were the node rows last settled by this chart?
@@ -88,7 +90,7 @@ export function createDataset(spec, makeChart) {
     const accessors = createTables(state, { spec, schemaSpec });
     const {
         seedContext, isContextRow, recountSeed, shapeData, primaryRows, reportedRows,
-        rowIndexOf, reportedIndexOf, isLockedIn, checkRows,
+        rowIndexOf, reportedIndexOf, isLockedIn, checkRows, seedCountOf, setSeedCount,
     } = accessors;
 
     // Context rows (spec.context) are decided once, over the seed.
@@ -124,9 +126,9 @@ export function createDataset(spec, makeChart) {
     };
 
     // `change` per committed edit; `select` and `hover` on a selection or hover
-    // change (no data moved).
-    /** @type {{ change: Set<Function>, select: Set<Function>, hover: Set<Function> }} */
-    const listeners = { change: new Set(), select: new Set(), hover: new Set() };
+    // change (no data moved); `gesture` once when a gesture that changed data ends.
+    /** @type {{ change: Set<Function>, select: Set<Function>, hover: Set<Function>, gesture: Set<Function> }} */
+    const listeners = { change: new Set(), select: new Set(), hover: new Set(), gesture: new Set() };
 
     // Notify a committed change; undo/redo notify through it too.
     const notifyChange = () => {
@@ -153,9 +155,38 @@ export function createDataset(spec, makeChart) {
     const clearHover = () => { hoverOwner = null; hoverFns.commitHover(null); };
 
     // One snapshot per gesture (engine/history.js).
+    // One event per gesture that changed data: what it started from, what it left,
+    // and which edits did it (deduplicated: a drag fires its edit on every move).
+    /** @param {{ before: any, edits: any[] }} done */
+    const notifyGesture = (done) => {
+        if (!listeners.gesture.size) return;
+        const seen = new Set();
+        const edits = done.edits.filter((e) => {
+            const k = `${e.type}\u0000${e.name ?? ''}\u0000${e.table}`;
+            if (seen.has(k)) return false;
+            seen.add(k);
+            return true;
+        });
+        const event = { edits, before: structuredClone(shapeTables(done.before.tables)), after: structuredClone(shapeData()) };
+        for (const cb of listeners.gesture) cb(event);
+    };
+    // The dataset's shape (getData's) for any set of tables: a bare array for a one-table schema.
+    /** @param {Record<string, any[]>} tables */
+    const shapeTables = (tables) => {
+        const live = state.tables;
+        state.tables = tables;
+        try { return shapeData(); } finally { state.tables = live; }
+    };
+
+    // Writes from outside (patch) that would renumber rows wait here while a stroke is in flight.
+    /** @type {{ plan: any[], history: 'keep' | 'record' }[]} */
+    let pending = [];
+    // One snapshot per gesture (engine/history.js).
     const history = createHistory(state, {
         schemaSpec, charts, layout, isContextRow, update: refresh,
         notifyChange: () => { clearHover(); notifyChange(); },
+        onGesture: notifyGesture,
+        afterTxn: () => { if (pending.length && !history.inGesture()) flushPending(); },
     });
 
     // Hover links once a second chart draws the dataset, so redraw the others
@@ -202,7 +233,8 @@ export function createDataset(spec, makeChart) {
             linked: () => charts.length > 1,
             recordHistory: () => history.recordHistory(hook),
             gestureTxn: (type) => history.gestureTxn(type, hook),
-            endTxn: () => history.endTxn(hook),
+            endTxn: () => history.endTxn(hook, { notify: true }),
+            noteEdit: (edit) => history.noteEdit(hook, edit),
             settleTurn: (stroking) => {
                 // Nothing is spaced mid-stroke; outside data waits for the release.
                 if (layout.pending && !stroking) {
@@ -244,6 +276,8 @@ export function createDataset(spec, makeChart) {
         for (const c of charts) c.drop('reseed');
         selected.clear(); // a reseed's row indices are new; drop the old selection
         clearHover();
+        // Writes queued against the old rows may name rows the new ones lack.
+        pending = [];
         // A reseed is a new starting point, so undo history is cleared.
         history.reset();
         refresh();
@@ -338,14 +372,193 @@ export function createDataset(spec, makeChart) {
         return true;
     };
 
-    // Subscribe to `change`, `select` or `hover`; returns an unsubscribe function.
+    // ── External writes: patch ─────────────────────────────────────────────────
+    // setData is a reseed, and says so: history, selection and any stroke in flight
+    // all go. That is right for "load a different dataset" and wrong for a second
+    // writer on the same one: an agent marking a step done while a person drags
+    // another. patch is that writer's door: rows addressed by KEY, not index, merged
+    // into the live dataset without disturbing the person.
+    //
+    // A row's key is its table's `key: true` field. A links table usually declares
+    // none, and there a link IS its pair of `ref` ends.
+
+    /** @param {string} name @returns {string[]} */
+    const keyFieldsOf = (name) => {
+        const table = schemaSpec.tables[name];
+        if (!table) throw new Error(`patch(): there is no table named "${name}".`);
+        const fields = Object.entries(table.fields);
+        const keys = fields.filter(([, f]) => f && /** @type {any} */ (f).key).map(([k]) => k);
+        if (keys.length) return keys;
+        const refs = fields.filter(([, f]) => f && f.type === 'ref').map(([k]) => k);
+        if (refs.length) return refs;
+        throw new Error(`patch(): table "${name}" has no key field (\`key: true\`) and no \`ref\` fields, so its rows cannot be addressed.`);
+    };
+    /** @param {string} name */
+    const safeKeyFields = (name) => { try { return keyFieldsOf(name); } catch { return null; } };
+    /** @param {string[]} fields @param {any} row */
+    const keyOfRow = (fields, row) => JSON.stringify(fields.map((f) => (row ? row[f] : undefined)));
+    // A `remove` entry: the bare key value for a one-field key, else a row-shaped object or an array.
+    /** @param {string[]} fields @param {any} k */
+    const keyOfRemoval = (fields, k) => {
+        if (Array.isArray(k)) return JSON.stringify(k);
+        if (k != null && typeof k === 'object') return keyOfRow(fields, k);
+        return JSON.stringify([k]);
+    };
+    /** @param {any} changes */
+    const compilePatch = (changes) => Object.entries(changes || {}).map(([name, ops]) => {
+        const fields = keyFieldsOf(name);
+        return {
+            name, fields,
+            insert: (ops && ops.insert) || [],
+            update: (ops && ops.update) || [],
+            remove: new Set(((ops && ops.remove) || []).map((/** @type {any} */ k) => keyOfRemoval(fields, k))),
+        };
+    });
+
+    // Apply a compiled patch to one set of tables: the live ones, or a snapshot's.
+    // `report` is passed for the live tables only: a snapshot that lacks a row the
+    // live data has is ordinary history, not a conflict. `keep(name, old, next)`
+    // carries what is held by row identity (context membership) to a replaced row.
+    /** @param {Record<string, any[]>} target @param {any[]} plan @param {any} [report] @param {(name: string, old: any, next: any) => void} [keep] */
+    const applyPatchTo = (target, plan, report, keep) => {
+        for (const op of plan) {
+            let rows = target[op.name] || [];
+            if (op.remove.size) rows = rows.filter((r) => !op.remove.has(keyOfRow(op.fields, r)));
+            else rows = rows.slice();
+            const at = new Map(rows.map((r, i) => [keyOfRow(op.fields, r), i]));
+            for (const row of op.update) {
+                const k = keyOfRow(op.fields, row);
+                const i = at.get(k);
+                if (i === undefined) { if (report) report.missing.push({ table: op.name, key: JSON.parse(k) }); continue; }
+                const next = { ...rows[i], ...structuredClone(row) };
+                if (keep) keep(op.name, rows[i], next);
+                rows[i] = next;
+                if (report) report.updated++;
+            }
+            for (const row of op.insert) {
+                const k = keyOfRow(op.fields, row);
+                if (at.has(k)) { if (report) report.conflicts.push({ table: op.name, key: JSON.parse(k) }); continue; }
+                at.set(k, rows.length);
+                rows.push(structuredClone(row));
+                if (report) report.inserted++;
+            }
+            target[op.name] = rows;
+        }
+        // A removed node takes its links with it, exactly as in a gesture.
+        enforceRefs(schemaSpec, target);
+        if (nestingOf(schemaSpec)) enforceTree(schemaSpec, target);
+    };
+
+    // A snapshot holds context membership as row indices; a removal renumbers them.
+    /** @param {any} snap @param {any[]} plan */
+    const rebaseSnapshot = (snap, plan) => {
+        /** @type {Record<string, string[] | null>} */
+        const contextKeys = {};
+        for (const [name, idx] of Object.entries(snap.context || {})) {
+            const fields = safeKeyFields(name);
+            contextKeys[name] = fields ? /** @type {number[]} */ (idx).map((i) => keyOfRow(fields, (snap.tables[name] || [])[i])) : null;
+        }
+        applyPatchTo(snap.tables, plan);
+        for (const [name, keys] of Object.entries(contextKeys)) {
+            const fields = safeKeyFields(name);
+            if (!keys || !fields) continue;
+            const want = new Set(keys);
+            snap.context[name] = (snap.tables[name] || []).map((/** @type {any} */ r, /** @type {number} */ i) => (want.has(keyOfRow(fields, r)) ? i : -1)).filter((/** @type {number} */ i) => i >= 0);
+        }
+    };
+
+    /** @param {any[]} plan @param {'keep' | 'record'} mode */
+    const applyPatchLive = (plan, mode) => {
+        const mid = history.inGesture();
+        // The selection names rows by index, and a removal renumbers rows: remember
+        // the selected rows by key, find them again afterwards.
+        const remembered = [...selected].map((key) => {
+            const at = key.indexOf('\u0000');
+            const table = key.slice(0, at), index = Number(key.slice(at + 1));
+            const fields = schemaSpec.tables[table] ? safeKeyFields(table) : null;
+            return { table, fields, key: fields ? keyOfRow(fields, (state.tables[table] || [])[index]) : null };
+        });
+        // A 'seed' lock reads "the first N rows". Removals keep order and inserts
+        // append, so the seeded rows stay at the head; only N has to shrink.
+        /** @type {Record<string, Set<string>>} */
+        const seededKeys = {};
+        for (const op of plan) {
+            seededKeys[op.name] = new Set((state.tables[op.name] || []).slice(0, seedCountOf(op.name)).map((r) => keyOfRow(op.fields, r)));
+        }
+        const sizes = Object.fromEntries(Object.entries(state.tables).map(([n, r]) => [n, r.length]));
+
+        if (mode === 'record') history.push();
+        const report = { inserted: 0, updated: 0, removed: 0, missing: /** @type {any[]} */ ([]), conflicts: /** @type {any[]} */ ([]) };
+        const tables = { ...state.tables };
+        applyPatchTo(tables, plan, report, (name, old, next) => {
+            const set = state.contextRows[name];
+            if (set && set.has(old)) set.add(next);
+        });
+        state.tables = tables;
+        validateTables(schemaSpec, state.tables, 'patch()');
+        // 'keep': the write is a fact about the data, not a step of the person's.
+        // Rebase it into every snapshot, so undoing their last drag cannot revert it.
+        if (mode === 'keep') history.rebase((snap) => rebaseSnapshot(snap, plan));
+
+        // Removed = rows gone, net of the rows inserted (cascaded links included).
+        let net = 0;
+        for (const name of new Set([...Object.keys(sizes), ...Object.keys(state.tables)])) {
+            net += (sizes[name] || 0) - (state.tables[name] || []).length;
+        }
+        report.removed = net + report.inserted;
+        for (const op of plan) {
+            if (seedCountOf(op.name)) setSeedCount(op.name, (state.tables[op.name] || []).filter((r) => seededKeys[op.name].has(keyOfRow(op.fields, r))).length);
+        }
+
+        const before = [...selected].join('|');
+        selected.clear();
+        for (const { table, fields, key } of remembered) {
+            if (key == null || !fields) continue;
+            const i = (state.tables[table] || []).findIndex((r) => keyOfRow(fields, r) === key);
+            if (i >= 0) selected.add(`${table}\u0000${i}`);
+        }
+        // Mid-stroke only field writes and appends land (nothing renumbers), so the
+        // stroke keeps its grab; otherwise what indexes rows is stale.
+        for (const c of charts) c.drop(mid ? 'preview' : 'rows');
+        layout.pending = true;
+        clearHover();
+        notifyChange();
+        if ([...selected].join('|') !== before) selectionFns.notifySelect();
+        refresh();
+        return report;
+    };
+    const flushPending = () => {
+        const queue = pending;
+        pending = [];
+        for (const p of queue) applyPatchLive(p.plan, p.history);
+    };
+
+    /** @param {any} changes @param {{ history?: 'keep' | 'record' }} [options] */
+    const patch = (changes, options = {}) => {
+        const mode = (options && options.history) ?? 'keep';
+        if (mode !== 'keep' && mode !== 'record') {
+            throw new Error(`patch(): history is "keep" or "record", not "${mode}".`);
+        }
+        const plan = compilePatch(changes);
+        // Mid-stroke, a chart holds the grabbed row by the INDEX it had at dragstart.
+        // Field writes and appends renumber nothing, so they land now; a removal would
+        // make the stroke write the wrong row, so it waits for the stroke to end, and
+        // so does anything queued behind it, so writes land in the order they were made.
+        if (history.inGesture() && (pending.length || plan.some((op) => op.remove.size))) {
+            pending.push({ plan, history: mode });
+            return { deferred: /** @type {const} */ (true) };
+        }
+        return applyPatchLive(plan, mode);
+    };
+
+    // Subscribe to `change`, `select`, `hover` or `gesture`; returns an unsubscribe function.
     /** @param {string} type @param {Function} cb */
     const on = (type, cb) => {
-        if (type !== 'change' && type !== 'select' && type !== 'hover') {
-            warn(`on:${type}`, `on("${type}"): no such event. A dataset fires "change", "select" and "hover"; a chart also fires "stage".`);
+        if (type !== 'change' && type !== 'select' && type !== 'hover' && type !== 'gesture') {
+            warn(`on:${type}`, `on("${type}"): no such event. A dataset fires "change", "select", "hover" and "gesture"; a chart also fires "stage".`);
             return () => false;
         }
-        const set = listeners[/** @type {'change' | 'select' | 'hover'} */ (type)];
+        const set = listeners[/** @type {'change' | 'select' | 'hover' | 'gesture'} */ (type)];
         set.add(cb);
         return () => set.delete(cb);
     };
@@ -360,6 +573,7 @@ export function createDataset(spec, makeChart) {
         setData,
         setDomain,
         set,
+        patch,
         undo: history.undo,
         redo: history.redo,
         canUndo: history.canUndo,

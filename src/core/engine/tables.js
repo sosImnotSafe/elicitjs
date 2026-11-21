@@ -201,5 +201,8 @@ export function createTables(state, deps) {
         tableOf, targetTableOf, primaryRows,
         seedContext, isContextRow, reportedRows, rowIndexOf, reportedIndexOf, shapeData,
         recountSeed, isLockedIn, lockRowsIn, constraintsIn, checkRows,
+        // A write from outside (patch) that removes seeded rows shrinks the count.
+        seedCountOf: (/** @type {string} */ name) => seedCounts[name] || 0,
+        setSeedCount: (/** @type {string} */ name, /** @type {number} */ n) => { seedCounts[name] = n; },
     };
 }

@@ -233,6 +233,7 @@ export function createChartApi(chart, deps) {
         setData: dataset.setData,
         setDomain: dataset.setDomain,
         set: dataset.set,
+        patch: dataset.patch,
         undo: dataset.undo,
         redo: dataset.redo,
         canUndo: dataset.canUndo,
@@ -248,9 +249,9 @@ export function createChartApi(chart, deps) {
         getHover: dataset.getHover,
         dataset,
         dom: () => container,
-        // `stage` is this chart's; `change`, `select` and `hover` are the dataset's.
+        // `stage` is this chart's; `change`, `select`, `hover` and `gesture` are the dataset's.
         on(type, cb) {
-            if (type !== 'stage') return dataset.on(type, cb);
+            if (type !== 'stage') return dataset.on(/** @type {any} */ (type), cb);
             listeners.stage.add(cb);
             return () => listeners.stage.delete(cb);
         },

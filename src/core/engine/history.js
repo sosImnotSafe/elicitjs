@@ -23,6 +23,8 @@ const MAX_HISTORY = 100;
  *   isContextRow: (name: string, d: any) => boolean,
  *   notifyChange: () => void,
  *   update: () => void,
+ *   onGesture?: (done: { before: any, edits: any[] }) => void,
+ *   afterTxn?: () => void,
  * }} deps
  */
 export function createHistory(state, deps) {
@@ -31,7 +33,10 @@ export function createHistory(state, deps) {
     let past = [];
     /** @type {any[]} */
     let future = [];
-    /** @type {{ owner: any, recorded: boolean } | null} */
+    // A transaction is one gesture. Besides its owner and whether it has snapshotted,
+    // it keeps the snapshot it started from and the edits that fired in it, so its
+    // end can be reported as one 'gesture' event rather than as every commit on the way.
+    /** @type {{ owner: any, recorded: boolean, before: any, edits: any[] } | null} */
     let txn = null;
     /** @type {any} */
     let wheelTimer = null;
@@ -78,21 +83,48 @@ export function createHistory(state, deps) {
     // Open a transaction for `owner`. The snapshot is taken lazily by
     // recordHistory, so a gesture that never commits clones nothing.
     /** @param {any} owner */
-    const beginTxn = (owner) => { txn = { owner, recorded: false }; };
+    const beginTxn = (owner) => { txn = { owner, recorded: false, before: null, edits: [] }; };
     // Close `owner`'s transaction; with no owner (a dataset method), whichever is open.
-    /** @param {any} [owner] */
-    const endTxn = (owner) => { if (owner === undefined || (txn && txn.owner === owner)) txn = null; };
+    // `notify` only where a gesture really ends (a chart's dispatch, a wheel burst going
+    // quiet): setData, undo and the dataset methods close one too, but no gesture happened.
+    /** @param {any} [owner] @param {{ notify?: boolean }} [options] */
+    const endTxn = (owner, options) => {
+        if (!(owner === undefined || (txn && txn.owner === owner))) return;
+        const done = txn;
+        txn = null;
+        if (options && options.notify && done && done.recorded && deps.onGesture) deps.onGesture(done);
+        if (deps.afterTxn) deps.afterTxn();
+    };
 
     // Called by every commit path before it mutates state. The first commit in
     // `owner`'s transaction snapshots the state and drops the redo stack.
     /** @param {any} [owner] */
     const recordHistory = (owner) => {
         if (txn && txn.owner === owner && txn.recorded) return;
+        const snap = snapshot();
+        past.push(snap);
+        if (past.length > MAX_HISTORY) past.shift();
+        future = [];
+        // `before` is the very snapshot the undo stack holds, so a write rebased into
+        // history (patch, 'keep') is rebased into the gesture's "before" too.
+        const edits = txn && txn.owner === owner ? txn.edits : [];
+        txn = { owner, recorded: true, before: snap, edits };
+    };
+
+    // Which edits the open gesture fired, for its 'gesture' event.
+    /** @param {any} owner @param {{ type: string, name?: string, table: string }} edit */
+    const noteEdit = (owner, edit) => { if (txn && txn.owner === owner) txn.edits.push(edit); };
+    // Is a chart's gesture open (a stroke in flight, a wheel burst)?
+    const inGesture = () => !!(txn && txn.owner != null);
+    // A step of its own for a write from outside, without closing a chart's gesture.
+    const push = () => {
         past.push(snapshot());
         if (past.length > MAX_HISTORY) past.shift();
         future = [];
-        txn = { owner, recorded: true };
     };
+    // Run `fn` over every snapshot, undo and redo alike (patch, 'keep').
+    /** @param {(snap: any) => void} fn */
+    const rebase = (fn) => { for (const snap of [...past, ...future]) fn(snap); };
 
     // Decide which transaction an incoming event belongs to. A dragstart always
     // opens a fresh one, so a lost dragend can't leak into the next gesture.
@@ -102,7 +134,7 @@ export function createHistory(state, deps) {
         if (type === 'wheel') {
             if (!txn || txn.owner !== owner || wheelTimer == null) beginTxn(owner);
             if (wheelTimer != null) clearTimeout(wheelTimer);
-            wheelTimer = setTimeout(() => { wheelTimer = null; endTxn(owner); }, 350);
+            wheelTimer = setTimeout(() => { wheelTimer = null; endTxn(owner, { notify: true }); }, 350);
         } else if (type === 'dragstart') beginTxn(owner);
         else if (!txn) beginTxn(owner);
     };
@@ -136,5 +168,5 @@ export function createHistory(state, deps) {
         return true;
     };
 
-    return { endTxn, recordHistory, gestureTxn, reset, canUndo, canRedo, undo, redo };
+    return { endTxn, recordHistory, gestureTxn, reset, canUndo, canRedo, undo, redo, noteEdit, inGesture, push, rebase };
 }
