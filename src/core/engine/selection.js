@@ -178,6 +178,8 @@ export function createSelection(state, deps) {
 
     return {
         selectionIn, selectionPrimary, selectionList, commitSelectionEdit,
+        // `select` for a selection a write from outside (patch) carried through a renumbering.
+        notifySelect,
         api: { getSelection, getSelectionAll, select, toggleSelection, selectAll, selectWhere, clearSelection },
     };
 }

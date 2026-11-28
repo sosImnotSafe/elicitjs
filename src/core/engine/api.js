@@ -330,6 +330,7 @@ export function createChartApi(chart, deps) {
         setData: dataset.setData,
         setDomain: dataset.setDomain,
         set: dataset.set,
+        patch: dataset.patch,
         undo: dataset.undo,
         redo: dataset.redo,
         canUndo: dataset.canUndo,
@@ -346,10 +347,10 @@ export function createChartApi(chart, deps) {
         getHover: dataset.getHover,
         dataset,
         dom: () => container,
-        // `stage`, `render` and `destroy` are this chart's; `change`, `select` and
-        // `hover` are the dataset's.
+        // `stage`, `render` and `destroy` are this chart's; `change`, `select`,
+        // `hover` and `gesture` are the dataset's.
         on(type, cb) {
-            if (type !== 'stage' && type !== 'render' && type !== 'destroy') return dataset.on(type, cb);
+            if (type !== 'stage' && type !== 'render' && type !== 'destroy') return dataset.on(/** @type {any} */ (type), cb);
             const set = listeners[type];
             set.add(cb);
             return () => set.delete(cb);

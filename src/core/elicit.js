@@ -298,6 +298,7 @@ function createChart(dataset, spec) {
         nodeBoxRule, nodePortsRule, containsRule, channelsDrawing,
         settleNodes, settledNodes, heldStill, activeEdits,
         selectionPrimary, commitSelectionEdit, recordHistory, notifyChange,
+        noteEdit: (edit) => port.noteEdit(edit),
         applyResize: (size) => applyResize(size),
     });
 
